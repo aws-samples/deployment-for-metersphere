@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: MeterSphere based Continuous Testing Platform
+Mappings:
+  InstanceMappings:
+    t3.micro:
+      DBInstanceType: db.t3.micro
+        
+    t3.small:
+      DBInstanceType: db.t3.small
+
+    c5.xlarge:
+      DBInstanceType: db.t3.medium
+        
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Required
+        Parameters:
+          - InstanceType
+
+Parameters:
+  InstanceType:
+    Type: String
+    AllowedValues:
+      - m5.xlarge
+      - m5.2xlarge
+    Default: m5.2xlarge
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Enable HTTP access via port 8081'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: 0.0.0.0/0
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy: # <--- creation policy with timeout of 15 minutes
+      ResourceSignal:
+        Timeout: PT15M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet0
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/xvda"
+          Ebs: 
+            VolumeType: "gp3"
+            DeleteOnTermination: "true"
+            VolumeSize: "30"
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: MeterSphere-Server
+      UserData:
+        Fn::Base64:
+          !Sub |
+          #!/bin/bash -xe
+          
+          amazon-linux-extras install docker -y
+          amazon-linux-extras install mariadb10.5  -y
+          
+          mysql -h${MeterSphereDB.Endpoint.Address} -uadmin -padmin123456 <<EOF
+          DROP DATABASE IF EXISTS metersphere;
+          CREATE DATABASE metersphere;
+          EOF
+        
+          wget --no-check-certificate https://github.com/metersphere/metersphere/releases/download/v1.20.15-lts/metersphere-online-installer-v1.20.15-lts.tar.gz
+
+          cp metersphere-online-installer-v1.20.15-lts.tar.gz /opt
+          cd /opt
+          tar zxvf metersphere-online-installer-v1.20.15-lts.tar.gz
+          
+          cd /opt/metersphere-online-installer-v1.20.15-lts
+        
+          sed -i -e "s#MS_EXTERNAL_MYSQL=.*#MS_EXTERNAL_MYSQL=true#g" install.conf
+          sed -i -e "s#MS_MYSQL_HOST=.*#MS_MYSQL_HOST=${MeterSphereDB.Endpoint.Address}#g" install.conf
+          sed -i -e "s#MS_MYSQL_USER=.*#MS_MYSQL_USER=admin#g" install.conf
+          sed -i -e "s#MS_MYSQL_PASSWORD=.*#MS_MYSQL_PASSWORD=admin123456#g" install.conf
+          
+          sed -i -e '/read -p/a\__choice="y"' install.sh
+          sed -i '/read -p/d' install.sh
+          
+          sh install.sh
+
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerInstance --region ${AWS::Region}
+
+  IPAddress:
+    Type: AWS::EC2::EIP
+  IPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref 'WebServerInstance'
+      EIP: !Ref 'IPAddress'
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Enable HTTP access via port 80'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+
+  MeterSphereDBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties: 
+      DBSubnetGroupDescription: MeterSphere-DB
+      SubnetIds: 
+        - !Ref PublicSubnet0
+        - !Ref PublicSubnet1
+      Tags: 
+        - 
+          Key: Name
+          Value: MeterSphere-RDS
+
+  MeterSphereDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: '10'
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 7
+      DBInstanceClass: db.m5.large
+      DBSubnetGroupName: !Ref MeterSphereDBSubnetGroup
+      Engine: mariadb
+      EngineVersion: '10.5'
+      MasterUsername: "admin"
+      MasterUserPassword: "admin123456"
+      MultiAZ: false
+      StorageEncrypted: true
+      StorageType: gp2
+      DBName: metersphere
+      Tags:
+        - Key: Name
+          Value: MeterSphere-RDS
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      CidrBlock: "10.0.0.0/16"
+      Tags:
+        -
+          Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        -
+          Key: "Network"
+          Value: "Public"
+        -
+          Key: "Name"
+          Value: "MeterSphereVPC"
+
+  PublicSubnet0:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId:
+        Ref: "VPC"
+      AvailabilityZone:
+        Fn::Sub:
+          - "${AWS::Region}${AZ}"
+          - AZ: "a"
+      CidrBlock: "10.0.0.0/20"
+      MapPublicIpOnLaunch: "true"
+      Tags:
+        -
+          Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        -
+          Key: "Network"
+          Value: "Public"
+        -
+          Key: "Name"
+          Value: !Join
+            - ''
+            - - "MeterSphereVPC"
+              - '-public-'
+              - "a"
+  PublicSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId:
+        Ref: "VPC"
+      AvailabilityZone:
+        Fn::Sub:
+          - "${AWS::Region}${AZ}"
+          - AZ: "b"
+      CidrBlock: "10.0.16.0/20"
+      MapPublicIpOnLaunch: "true"
+      Tags:
+        -
+          Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        -
+          Key: "Network"
+          Value: "Public"
+        -
+          Key: "Name"
+          Value: !Join
+            - ''
+            - - "MeterSphereVPC"
+              - '-public-'
+              - "b"
+
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        -
+          Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        -
+          Key: "Network"
+          Value: "Public"
+        -
+          Key: "Name"
+          Value: !Join
+            - ''
+            - - "MeterSphereVPC"
+              - '-IGW'
+  GatewayToInternet:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId:
+        Ref: "VPC"
+      InternetGatewayId:
+        Ref: "InternetGateway"
+
+  PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId:
+        Ref: "VPC"
+      Tags:
+        -
+          Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        -
+          Key: "Network"
+          Value: "Public"
+        -
+          Key: "Name"
+          Value: !Join
+            - ''
+            - - "MeterSphereVPC"
+              - '-public-route-table'
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: "GatewayToInternet"
+    Properties:
+      RouteTableId:
+        Ref: "PublicRouteTable"
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId:
+        Ref: "InternetGateway"
+  PublicSubnetRouteTableAssociation0:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId:
+        Ref: "PublicSubnet0"
+      RouteTableId:
+        Ref: "PublicRouteTable"
+  PublicSubnetRouteTableAssociation1:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId:
+        Ref: "PublicSubnet1"
+      RouteTableId:
+        Ref: "PublicRouteTable"
+  PublicNetworkAcl:
+    Type: "AWS::EC2::NetworkAcl"
+    Properties:
+      VpcId:
+        Ref: "VPC"
+      Tags:
+        -
+          Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        -
+          Key: "Network"
+          Value: "Public"
+        -
+          Key: "Name"
+          Value: !Join
+            - ''
+            - - "MeterSphereVPC"
+              - '-public-nacl'
+  InboundHTTPPublicNetworkAclEntry:
+    Type: "AWS::EC2::NetworkAclEntry"
+    Properties:
+      NetworkAclId:
+        Ref: "PublicNetworkAcl"
+      RuleNumber: "100"
+      Protocol: "-1"
+      RuleAction: "allow"
+      Egress: "false"
+      CidrBlock: "0.0.0.0/0"
+      PortRange:
+        From: "0"
+        To: "65535"
+  OutboundPublicNetworkAclEntry:
+    Type: "AWS::EC2::NetworkAclEntry"
+    Properties:
+      NetworkAclId:
+        Ref: "PublicNetworkAcl"
+      RuleNumber: "100"
+      Protocol: "-1"
+      RuleAction: "allow"
+      Egress: "true"
+      CidrBlock: "0.0.0.0/0"
+      PortRange:
+        From: "0"
+        To: "65535"
+  PublicSubnetNetworkAclAssociation0:
+    Type: "AWS::EC2::SubnetNetworkAclAssociation"
+    Properties:
+      SubnetId:
+        Ref: "PublicSubnet0"
+      NetworkAclId:
+        Ref: "PublicNetworkAcl"
+  PublicSubnetNetworkAclAssociation1:
+    Type: "AWS::EC2::SubnetNetworkAclAssociation"
+    Properties:
+      SubnetId:
+        Ref: "PublicSubnet1"
+      NetworkAclId:
+        Ref: "PublicNetworkAcl"
+
+Outputs:
+  ServiceIPAddress:
+    Description: MeterSphere Server IP address
+    Value: !Sub ["http://${IPAddress}:8081", IPAddress: !Ref IPAddress]
+  LoginUser:
+    Description: MeterSphere login username
+    Value: "admin"
+  LoginPassword:
+    Description: MeterSphere login password
+    Value: "metersphere"
